@@ -1,5 +1,6 @@
 #include <obs-module.h>
 #include <util/dstr.h>
+#include <util/platform.h>
 #include <util/threading.h>
 
 #include <turbojpeg.h>
@@ -291,6 +292,10 @@ void *obs_ntr_net_thread_run(void *data)
 				pthread_mutex_unlock(&connection_data->buffer_mutex[packet.is_top]);
 			}
 		}
+		else
+		{
+			sched_yield();
+		}
 	}
 
 	return 0;
@@ -333,7 +338,17 @@ void obs_ntr_connection_create(struct ntr_connection_setup *connection_setup)
 
 
 	shared_connection_data = temp_connection_data;
-	pthread_create(&shared_connection_data->net_thread, NULL, obs_ntr_net_thread_run, shared_connection_data);
+
+	struct sched_param thread_schedparam;
+	thread_schedparam.sched_priority = 10;
+
+	pthread_attr_t *thread_settings = NULL;
+	pthread_attr_init(thread_settings);
+	pthread_attr_setschedparam(thread_settings, &thread_schedparam);
+
+	pthread_create(&shared_connection_data->net_thread, thread_settings, obs_ntr_net_thread_run, shared_connection_data);
+
+	pthread_attr_destroy(thread_settings);
 }
 
 void obs_ntr_connection_destroy()
