@@ -60,7 +60,7 @@ struct ntr_data_packet
 	unsigned char is_last : 1;
 	unsigned char flags_pad2 : 3;
 	unsigned char format;
-	unsigned char count;
+	unsigned char order;
 
 	unsigned char data[DATA_PACKET_DATA_SIZE];
 };
@@ -74,6 +74,21 @@ struct ntr_connection_setup
 	enum ntr_screen priority_screen;
 };
 
+struct ntr_frame_data
+{
+	unsigned char is_top;
+	unsigned char id;
+	unsigned char packet_count;
+	unsigned char expected_packet_count;
+	unsigned char finished;
+	int last_packet_data_size;
+
+	uint64_t time_started;
+
+	unsigned char *frame_data;
+};
+
+#define CONCURRENT_FRAMES 4
 struct ntr_connection_data
 {
 	pthread_t net_thread;
@@ -88,11 +103,11 @@ struct ntr_connection_data
 	unsigned char *uncompressed_buffer[SCREEN_COUNT];
 	int last_frame_id[SCREEN_COUNT];
 
-	int frame_in_progress_id;
-	int frame_in_progress_packet_count;
-	int frame_in_progress_expected_packet_count;
-	int frame_in_progress_final_packet_data_size;
-	unsigned char *frame_in_progress;
+	struct ntr_frame_data frames[CONCURRENT_FRAMES];
+
+	int frames_processed;
+	int frames_dumped;
+	uint64_t last_stat_time;
 };
 
 struct ntr_data
@@ -163,8 +178,27 @@ void *obs_ntr_net_thread_run(void *data)
 
 	connection_data->is_connected = (bind_result == 0 && connect_result >= 0 && bind_data_result == 0);
 
+	connection_data->frames_processed = 0;
+	connection_data->frames_dumped = 0;
+	connection_data->last_stat_time = obs_get_video_frame_time();
+
 	while (connection_data->is_connected)
 	{
+		if (connection_data->frames_processed >= 100)
+		{
+			uint64_t now = obs_get_video_frame_time();
+
+			uint64_t elapsed_ms = (now - connection_data->last_stat_time) / 1000000;
+			float elapsed_seconds = (float)(elapsed_ms) / 1000.0f;
+			float fps = (connection_data->frames_processed - connection_data->frames_dumped) / elapsed_seconds;
+
+			blog(LOG_DEBUG, "obs-ntr: Dropped %d/%d frames; effective fps=%f", connection_data->frames_dumped, connection_data->frames_processed, fps);
+
+			connection_data->frames_processed = 0;
+			connection_data->frames_dumped = 0;
+			connection_data->last_stat_time = now;
+		}
+
 		struct sockaddr_in from_address;
 		int from_address_length = sizeof(struct sockaddr_in);
 		struct ntr_data_packet packet;
@@ -172,46 +206,83 @@ void *obs_ntr_net_thread_run(void *data)
 
 		if (receive_result > 0)
 		{
-			if (packet.id != connection_data->frame_in_progress_id)
+			struct ntr_frame_data *active_frame = NULL;
+
+			for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
 			{
-				if (connection_data->frame_in_progress_expected_packet_count < 0 || connection_data->frame_in_progress_packet_count < connection_data->frame_in_progress_expected_packet_count)
+				if ((connection_data->frames[frame_index].id == packet.id && connection_data->frames[frame_index].is_top == packet.is_top) ||
+					connection_data->frames[frame_index].finished)
 				{
-					/*blog(LOG_DEBUG, "Dumping frame %d (%d/%d) for frame %d (%d)", connection_data->frame_in_progress_id, 
-						connection_data->frame_in_progress_packet_count, connection_data->frame_in_progress_expected_packet_count,
-						packet.id, packet.is_top);*/
+					active_frame = &connection_data->frames[frame_index];
+					break;
+				}
+			}
+
+			if (active_frame == NULL)
+			{
+				int oldest_index = 0;
+				uint64_t oldest_time = UINT64_MAX;
+				for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
+				{
+					if (connection_data->frames[frame_index].time_started < oldest_time)
+					{
+						oldest_time = connection_data->frames[frame_index].time_started;
+						oldest_index = frame_index;
+					}
 				}
 
-				connection_data->frame_in_progress_id = packet.id;
-				connection_data->frame_in_progress_packet_count = 0;
-				connection_data->frame_in_progress_expected_packet_count = -1;
-				connection_data->frame_in_progress_final_packet_data_size = 0;
+				active_frame = &connection_data->frames[oldest_index];
+			}
+
+			assert(active_frame != NULL);
+
+			if (active_frame->id != packet.id || active_frame->is_top != packet.is_top || active_frame->finished)
+			{
+				if (!active_frame->finished)
+				{
+					/*blog(LOG_DEBUG, "Dumping frame %d (%d/%d) for frame %d (%d)", active_frame->id,
+						active_frame->packet_count, active_frame->expected_packet_count,
+						packet.id, packet.is_top);*/
+
+					connection_data->frames_processed++;
+					connection_data->frames_dumped++;
+				}
+
+				active_frame->is_top = packet.is_top;
+				active_frame->id = packet.id;
+				active_frame->expected_packet_count = 0;
+				active_frame->packet_count = 0;
+				active_frame->last_packet_data_size = 0;
+				active_frame->finished = false;
+				active_frame->time_started = obs_get_video_frame_time();
 			}
 
 			if (packet.is_last)
 			{
-				connection_data->frame_in_progress_expected_packet_count = packet.count + 1;
-				connection_data->frame_in_progress_final_packet_data_size = receive_result - 4;
+				active_frame->expected_packet_count = packet.order + 1;
+				active_frame->last_packet_data_size = receive_result - 4;
 
-				memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, 
-					connection_data->frame_in_progress_final_packet_data_size);
+				memcpy(active_frame->frame_data + (DATA_PACKET_DATA_SIZE * packet.order), packet.data,
+					active_frame->last_packet_data_size);
 			}
 			else
 			{
-				memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, DATA_PACKET_DATA_SIZE);
+				memcpy(active_frame->frame_data + (DATA_PACKET_DATA_SIZE * packet.order), packet.data, DATA_PACKET_DATA_SIZE);
 			}
 
-			connection_data->frame_in_progress_packet_count++;
+			active_frame->packet_count++;
 
-			if (connection_data->frame_in_progress_expected_packet_count >= 0 &&
-				connection_data->frame_in_progress_packet_count >= connection_data->frame_in_progress_expected_packet_count)
+			if (active_frame->expected_packet_count > 0 && active_frame->packet_count >= active_frame->expected_packet_count)
 			{
-				//blog(LOG_DEBUG, "Finishing frame %d with %d/%d packets", connection_data->frame_in_progress_id, connection_data->frame_in_progress_packet_count, connection_data->frame_in_progress_expected_packet_count);
+				//blog(LOG_DEBUG, "Finishing frame %d with %d/%d packets", active_frame->id, active_frame->packet_count, active_frame->expected_packet_count);
 
-				memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, receive_result - 4);
+				active_frame->finished = true;
+
+				connection_data->frames_processed++;
 
 				pthread_mutex_lock(&connection_data->buffer_mutex[packet.is_top]);
-				int decompress_result = tjDecompress2(connection_data->decompressor_handle, connection_data->frame_in_progress,
-					(connection_data->frame_in_progress_expected_packet_count - 1) * DATA_PACKET_DATA_SIZE + connection_data->frame_in_progress_final_packet_data_size,
+				int decompress_result = tjDecompress2(connection_data->decompressor_handle, active_frame->frame_data,
+					(active_frame->expected_packet_count - 1) * DATA_PACKET_DATA_SIZE + active_frame->last_packet_data_size,
 					connection_data->uncompressed_buffer[packet.is_top], SCREEN_HEIGHT[packet.is_top], SCREEN_HEIGHT[packet.is_top] * 4,
 					SCREEN_WIDTH[packet.is_top], TJPF_RGBA, 0);
 
@@ -219,10 +290,6 @@ void *obs_ntr_net_thread_run(void *data)
 
 				pthread_mutex_unlock(&connection_data->buffer_mutex[packet.is_top]);
 			}
-		}
-		else
-		{
-			Sleep(0);
 		}
 	}
 
@@ -252,7 +319,18 @@ void obs_ntr_connection_create(struct ntr_connection_setup *connection_setup)
 		pthread_mutex_init(&temp_connection_data->buffer_mutex[screen_index], NULL);
 	}
 
-	temp_connection_data->frame_in_progress = bzalloc(DATA_PACKET_DATA_SIZE * DATA_PACKET_MAX_COUNT);
+	for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
+	{
+		temp_connection_data->frames[frame_index].id = 0;
+		temp_connection_data->frames[frame_index].packet_count = 0;
+		temp_connection_data->frames[frame_index].expected_packet_count = 0;
+		temp_connection_data->frames[frame_index].last_packet_data_size = 0;
+		temp_connection_data->frames[frame_index].finished = 0;
+		temp_connection_data->frames[frame_index].time_started = 0;
+
+		temp_connection_data->frames[frame_index].frame_data = bzalloc(DATA_PACKET_DATA_SIZE * DATA_PACKET_MAX_COUNT);
+	}
+
 
 	shared_connection_data = temp_connection_data;
 	pthread_create(&shared_connection_data->net_thread, NULL, obs_ntr_net_thread_run, shared_connection_data);
@@ -263,21 +341,28 @@ void obs_ntr_connection_destroy()
 	struct ntr_connection_data *temp_connection_data = shared_connection_data;
 	shared_connection_data = NULL;
 
-	temp_connection_data->is_connected = false;
-	pthread_join(temp_connection_data->net_thread, NULL);
-
-	for (int screen_index = 0; screen_index < SCREEN_COUNT; screen_index++)
+	if (temp_connection_data != NULL)
 	{
-		pthread_mutex_destroy(&temp_connection_data->buffer_mutex[screen_index]);
-		bfree(temp_connection_data->uncompressed_buffer[screen_index]);
+		temp_connection_data->is_connected = false;
+		pthread_join(temp_connection_data->net_thread, NULL);
+
+		for (int screen_index = 0; screen_index < SCREEN_COUNT; screen_index++)
+		{
+			pthread_mutex_destroy(&temp_connection_data->buffer_mutex[screen_index]);
+			bfree(temp_connection_data->uncompressed_buffer[screen_index]);
+		}
+
+		tjDestroy(temp_connection_data->decompressor_handle);
+
+		closesocket(temp_connection_data->data_socket);
+
+		for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
+		{
+			bfree(temp_connection_data->frames[frame_index].frame_data);
+		}
+
+		bfree(temp_connection_data);
 	}
-
-	tjDestroy(temp_connection_data->decompressor_handle);
-
-	closesocket(temp_connection_data->data_socket);
-	bfree(temp_connection_data->frame_in_progress);
-
-	bfree(temp_connection_data);
 }
 
 
