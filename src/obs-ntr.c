@@ -89,8 +89,9 @@ struct ntr_connection_data
 	int last_frame_id[SCREEN_COUNT];
 
 	int frame_in_progress_id;
-	int frame_in_progress_last_index;
-	bool frame_in_progress_valid;
+	int frame_in_progress_packet_count;
+	int frame_in_progress_expected_packet_count;
+	int frame_in_progress_final_packet_data_size;
 	unsigned char *frame_in_progress;
 };
 
@@ -171,45 +172,52 @@ void *obs_ntr_net_thread_run(void *data)
 
 		if (receive_result > 0)
 		{
-			if (packet.count == 0)
+			if (packet.id != connection_data->frame_in_progress_id)
 			{
+				if (connection_data->frame_in_progress_expected_packet_count < 0 || connection_data->frame_in_progress_packet_count < connection_data->frame_in_progress_expected_packet_count)
+				{
+					/*blog(LOG_DEBUG, "Dumping frame %d (%d/%d) for frame %d (%d)", connection_data->frame_in_progress_id, 
+						connection_data->frame_in_progress_packet_count, connection_data->frame_in_progress_expected_packet_count,
+						packet.id, packet.is_top);*/
+				}
+
 				connection_data->frame_in_progress_id = packet.id;
-				connection_data->frame_in_progress_valid = true;
-				connection_data->frame_in_progress_last_index = packet.count;
-			}
-			else if (connection_data->frame_in_progress_valid &&
-				packet.id == connection_data->frame_in_progress_id &&
-				packet.count == connection_data->frame_in_progress_last_index + 1)
-			{
-				connection_data->frame_in_progress_last_index = packet.count;
-			}
-			else if (connection_data->frame_in_progress_valid)
-			{
-				connection_data->frame_in_progress_valid = false;
+				connection_data->frame_in_progress_packet_count = 0;
+				connection_data->frame_in_progress_expected_packet_count = -1;
+				connection_data->frame_in_progress_final_packet_data_size = 0;
 			}
 
-			if (connection_data->frame_in_progress_valid)
+			if (packet.is_last)
 			{
-				if (packet.is_last)
-				{
-					memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, receive_result - 4);
+				connection_data->frame_in_progress_expected_packet_count = packet.count + 1;
+				connection_data->frame_in_progress_final_packet_data_size = receive_result - 4;
 
-					pthread_mutex_lock(&connection_data->buffer_mutex[packet.is_top]);
-					int decompress_result = tjDecompress2(connection_data->decompressor_handle, connection_data->frame_in_progress,
-						packet.count * DATA_PACKET_DATA_SIZE + receive_result - 4,
-						connection_data->uncompressed_buffer[packet.is_top], SCREEN_HEIGHT[packet.is_top], SCREEN_HEIGHT[packet.is_top] * 4, 
-						SCREEN_WIDTH[packet.is_top], TJPF_RGBA, 0);
+				memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, 
+					connection_data->frame_in_progress_final_packet_data_size);
+			}
+			else
+			{
+				memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, DATA_PACKET_DATA_SIZE);
+			}
 
-					connection_data->last_frame_id[packet.is_top] = packet.id;
+			connection_data->frame_in_progress_packet_count++;
 
-					pthread_mutex_unlock(&connection_data->buffer_mutex[packet.is_top]);
+			if (connection_data->frame_in_progress_expected_packet_count >= 0 &&
+				connection_data->frame_in_progress_packet_count >= connection_data->frame_in_progress_expected_packet_count)
+			{
+				//blog(LOG_DEBUG, "Finishing frame %d with %d/%d packets", connection_data->frame_in_progress_id, connection_data->frame_in_progress_packet_count, connection_data->frame_in_progress_expected_packet_count);
 
-					connection_data->frame_in_progress_valid = false;
-				}
-				else
-				{
-					memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, DATA_PACKET_DATA_SIZE);
-				}
+				memcpy(connection_data->frame_in_progress + (DATA_PACKET_DATA_SIZE * packet.count), packet.data, receive_result - 4);
+
+				pthread_mutex_lock(&connection_data->buffer_mutex[packet.is_top]);
+				int decompress_result = tjDecompress2(connection_data->decompressor_handle, connection_data->frame_in_progress,
+					(connection_data->frame_in_progress_expected_packet_count - 1) * DATA_PACKET_DATA_SIZE + connection_data->frame_in_progress_final_packet_data_size,
+					connection_data->uncompressed_buffer[packet.is_top], SCREEN_HEIGHT[packet.is_top], SCREEN_HEIGHT[packet.is_top] * 4,
+					SCREEN_WIDTH[packet.is_top], TJPF_RGBA, 0);
+
+				connection_data->last_frame_id[packet.is_top] = packet.id;
+
+				pthread_mutex_unlock(&connection_data->buffer_mutex[packet.is_top]);
 			}
 		}
 		else
@@ -299,6 +307,11 @@ static void *obs_ntr_create(obs_data_t *settings, obs_source_t *source)
 static void obs_ntr_destroy(void *data)
 {
 	struct ntr_data *context = data;
+
+	if (context->owns_connection)
+	{
+		obs_ntr_connection_destroy();
+	}
 
 	if (context->texture != NULL)
 	{
