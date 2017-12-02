@@ -358,9 +358,9 @@ static obs_properties_t *obs_ntr_properties(void *data)
 		{
 			obs_properties_add_text(props, "ip_address", obs_module_text("Ntr.IpAddress"), OBS_TEXT_DEFAULT);
 
-			obs_properties_add_int_slider(props, "quality", obs_module_text("Ntr.Quality"), 0, 100, 1);
+			obs_properties_add_int_slider(props, "quality", obs_module_text("Ntr.Quality"), 10, 100, 1);
 
-			obs_properties_add_int(props, "qos", obs_module_text("Ntr.Qos"), 0, 100, 1);
+			obs_properties_add_int(props, "qos", obs_module_text("Ntr.Qos"), 0, 101, 1);
 
 			obs_properties_add_int(props, "priority_factor", obs_module_text("Ntr.PriorityFactor"), 0, 10, 1);
 
@@ -389,7 +389,7 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 	dstr_copy(&context->connection_setup.ip_address, obs_data_get_string(settings, "ip_address"));
 	context->connection_setup.quality = (int)obs_data_get_int(settings, "quality");
 	context->connection_setup.qos = (int)obs_data_get_int(settings, "qos");
-	context->connection_setup.priority_factor = (int)obs_data_get_int(settings, "priority_factory");
+	context->connection_setup.priority_factor = (int)obs_data_get_int(settings, "priority_factor");
 	context->connection_setup.priority_screen = (int)obs_data_get_int(settings, "priority_screen");
 
 	obs_enter_graphics();
