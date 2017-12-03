@@ -283,7 +283,7 @@ void *obs_ntr_net_thread_run(void *data)
 				float elapsed_seconds = (float)(elapsed_ms) / 1000.0f;
 				float fps = (connection_data->frames_processed - connection_data->frames_dumped) / elapsed_seconds;
 
-				blog(LOG_DEBUG, "obs-ntr: Dropped %d/%d frames; effective fps=%f", connection_data->frames_dumped, connection_data->frames_processed, fps);
+				blog(LOG_INFO, "obs-ntr: Dropped %d/%d frames; effective fps=%f", connection_data->frames_dumped, connection_data->frames_processed, fps);
 
 				connection_data->frames_processed = 0;
 				connection_data->frames_dumped = 0;
@@ -627,6 +627,7 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 {
 	struct ntr_data *context = data;
 
+	enum ntr_screen old_screen = context->screen;
 	context->screen = obs_data_get_int(settings, "screen");
 
 	dstr_copy(&context->connection_setup.ip_address, obs_data_get_string(settings, "ip_address"));
@@ -647,19 +648,24 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 		connection_owner = NULL;
 	}
 
-	obs_enter_graphics();
-
-	if (context->texture == NULL)
+	if (old_screen != context->screen || context->texture == NULL)
 	{
-		gs_texture_destroy(context->texture);
+		obs_enter_graphics();
+
+		if (context->texture != NULL)
+		{
+			gs_texture_destroy(context->texture);
+		}
+
+		context->texture = gs_texture_create(SCREEN_HEIGHT[context->screen], SCREEN_WIDTH[context->screen], GS_RGBA, 1, NULL, GS_DYNAMIC);
+
+		obs_leave_graphics();
 	}
-
-	context->texture = gs_texture_create(SCREEN_HEIGHT[context->screen], SCREEN_WIDTH[context->screen], GS_RGBA, 1, NULL, GS_DYNAMIC);
-
-	obs_leave_graphics();
 
 	if (context->pending_property_refresh)
 	{
+		context->pending_property_refresh = false;
+
 		obs_source_update_properties(context->source);
 	}
 
