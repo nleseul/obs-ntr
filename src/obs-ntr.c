@@ -16,6 +16,7 @@ enum ntr_command_type
 
 enum ntr_command
 {
+	NS_CMD_HEARTBEAT = 0,
 	NS_CMD_REMOTEPLAY = 901
 };
 
@@ -94,9 +95,9 @@ struct ntr_connection_data
 {
 	pthread_t net_thread;
 	pthread_mutex_t buffer_mutex[SCREEN_COUNT];
-
-	SOCKET data_socket;
-	bool is_connected;
+	bool net_thread_started;
+	bool net_thread_exited;
+	bool disconnect_requested;
 
 	struct ntr_connection_setup connection_setup;
 
@@ -115,23 +116,27 @@ struct ntr_data
 {
 	obs_source_t *source;
 
-	bool owns_connection;
-
 	bool pending_connect;
+	bool pending_property_refresh;
 
 	enum ntr_screen screen;
 	int last_frame_id;
 
 	struct ntr_connection_setup connection_setup;
 
+	pthread_t startup_remoteview_thread;
+	bool startup_remoteview_thread_started;
+	bool startup_remoteview_thread_running;
+
 	gs_texture_t *texture;
 };
 
 
-
-void *obs_ntr_net_thread_run(void *data)
+void *obs_ntr_startup_remoteview_thread_run(void *data)
 {
-	struct ntr_connection_data *connection_data = data;
+	struct ntr_data *context = data;
+
+	context->startup_remoteview_thread_running = true;
 
 	struct sockaddr_in client_address;
 	client_address.sin_family = AF_INET;
@@ -140,50 +145,131 @@ void *obs_ntr_net_thread_run(void *data)
 
 	struct sockaddr_in server_address;
 	server_address.sin_family = AF_INET;
-	server_address.sin_addr.s_addr = inet_addr(connection_data->connection_setup.ip_address.array);
+	server_address.sin_addr.s_addr = inet_addr(context->connection_setup.ip_address.array);
 	server_address.sin_port = htons(8000);
 
 
 	SOCKET command_socket = socket(AF_INET, SOCK_STREAM, 0);
-	int bind_result = bind(command_socket, (struct sockaddr *)&client_address, sizeof(struct sockaddr_in));
-	int connect_result = connect(command_socket, (struct sockaddr *)&server_address, sizeof(struct sockaddr_in));
+
+	if (command_socket == INVALID_SOCKET)
+	{
+		blog(LOG_WARNING, "obs-ntr: Failed to create socket to send startup command to NTR");
+		goto exception;
+	}
+
+	if (bind(command_socket, (struct sockaddr *)&client_address, sizeof(struct sockaddr_in)) != 0)
+	{
+		blog(LOG_WARNING, "obs-ntr: Failed to bind socket to send startup command to NTR");
+		goto exception;
+	}
+
+	if (connect(command_socket, (struct sockaddr *)&server_address, sizeof(struct sockaddr_in)) != 0)
+	{
+		blog(LOG_WARNING, "obs-ntr: Failed to connect to %s to send startup command to NTR", context->connection_setup.ip_address.array);
+		goto exception;
+	}
 
 	struct ntr_command_packet start_command;
 	start_command.magic_number = 0x12345678;
 	start_command.sequence = 1;
 	start_command.type = NS_TYPE_NORMAL;
 	start_command.command = NS_CMD_REMOTEPLAY;
-	start_command.args[0] = (connection_data->connection_setup.priority_screen << 8) | connection_data->connection_setup.priority_factor;
-	start_command.args[1] = connection_data->connection_setup.quality;
-	start_command.args[2] = connection_data->connection_setup.qos * 1024 * 1024 / 8;
+	start_command.args[0] = (context->connection_setup.priority_screen << 8) | context->connection_setup.priority_factor;
+	start_command.args[1] = context->connection_setup.quality;
+	start_command.args[2] = context->connection_setup.qos * 1024 * 1024 / 8;
 
-	int packet_size = sizeof(struct ntr_command_packet);
-	send(command_socket, (const char *)&start_command, packet_size, 0);
+	if (send(command_socket, (const char *)&start_command, sizeof(struct ntr_command_packet), 0) < 0)
+	{
+		blog(LOG_WARNING, "obs-ntr: Failed sending startup command to NTR");
+		goto exception;
+	}
+
+	// The original NTRViewer sends three heartbeats after starting up remoteview for some reason. 
+	// Probably this is used to verify that the NTR service on the 3DS didn't crash on boot or something?
+	// In any case, NTR will not send any data packets back until we do this. 
+	os_sleep_ms(100);
+
+	struct ntr_command_packet heartbeat_command;
+	heartbeat_command.magic_number = 0x12345678;
+	heartbeat_command.type = NS_TYPE_NORMAL;
+	heartbeat_command.command = NS_CMD_HEARTBEAT;
+	for (int ping_index = 0; ping_index < 3; ping_index++)
+	{
+		heartbeat_command.sequence = ping_index + 2;
+		if (send(command_socket, (const char *)&heartbeat_command, sizeof(struct ntr_command_packet), 0) < 0)
+		{
+			blog(LOG_WARNING, "obs-ntr: Failed sending initial heartbeat to NTR");
+			goto exception;
+		}
+
+		os_sleep_ms(100);
+	}
+
 	closesocket(command_socket);
 
-	struct sockaddr_in server_address_data;
-	server_address_data.sin_family = AF_INET;
-	server_address_data.sin_addr.s_addr = htonl(INADDR_ANY);
-	server_address_data.sin_port = htons(8001);
+	blog(LOG_WARNING, "obs-ntr: Startup command sent successfully to NTR");
 
-	connection_data->data_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	int bind_data_result = bind(connection_data->data_socket, (struct sockaddr *)&server_address_data, sizeof(struct sockaddr_in));
+	context->startup_remoteview_thread_running = false;
 
+	return 0;
+
+exception:
+
+	if (command_socket != INVALID_SOCKET)
+	{
+		closesocket(command_socket);
+	}
+	context->startup_remoteview_thread_running = false;
+	return (void *)1;
+}
+
+#define MAX_FAILED_READS 100
+
+void *obs_ntr_net_thread_run(void *data)
+{
+	struct ntr_connection_data *connection_data = data;
+
+	int failed_read_count = 0;
+
+	connection_data->disconnect_requested = false;
+	
+	struct sockaddr_in data_socket_address_data;
+	data_socket_address_data.sin_family = AF_INET;
+	data_socket_address_data.sin_addr.s_addr = htonl(INADDR_ANY);
+	data_socket_address_data.sin_port = htons(8001);
+
+	SOCKET data_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+	if (data_socket == INVALID_SOCKET)
+	{
+		blog(LOG_WARNING, "obs-ntr: Failed creating a data socket");
+		goto exception;
+	}
+
+	if (bind(data_socket, (struct sockaddr *)&data_socket_address_data, sizeof(struct sockaddr_in)) != 0)
+	{
+		blog(LOG_WARNING, "obs-ntr: Failed binding a data socket");
+		goto exception;
+	}
 
 	int buffer_size = 8 * 1024 * 1024;
 	struct timeval timeout;
 	timeout.tv_sec = 1;
 	timeout.tv_usec = 0;
-	setsockopt(connection_data->data_socket, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(int));
-	setsockopt(connection_data->data_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(struct timeval));
-
-	connection_data->is_connected = (bind_result == 0 && connect_result >= 0 && bind_data_result == 0);
+	if (setsockopt(data_socket, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(int)) != 0)
+	{
+		blog(LOG_WARNING, "obs-ntr: Unable to set buffer size on data socket");
+	}
+	if (setsockopt(data_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(struct timeval)) != 0)
+	{
+		blog(LOG_WARNING, "obs-ntr: Unable to set timeout on data socket");
+	}
 
 	connection_data->frames_processed = 0;
 	connection_data->frames_dumped = 0;
 	connection_data->last_stat_time = obs_get_video_frame_time();
 
-	while (connection_data->is_connected)
+	while (!connection_data->disconnect_requested)
 	{
 		if (connection_data->frames_processed >= 100)
 		{
@@ -203,11 +289,13 @@ void *obs_ntr_net_thread_run(void *data)
 		struct sockaddr_in from_address;
 		int from_address_length = sizeof(struct sockaddr_in);
 		struct ntr_data_packet packet;
-		int receive_result = recvfrom(connection_data->data_socket, (char *)&packet, sizeof(struct ntr_data_packet), 0, (struct sockaddr *)&from_address, &from_address_length);
+		int receive_result = recvfrom(data_socket, (char *)&packet, sizeof(struct ntr_data_packet), 0, (struct sockaddr *)&from_address, &from_address_length);
 
 		if (receive_result > 0)
 		{
 			struct ntr_frame_data *active_frame = NULL;
+
+			failed_read_count = 0;
 
 			for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
 			{
@@ -294,14 +382,34 @@ void *obs_ntr_net_thread_run(void *data)
 		}
 		else
 		{
+			failed_read_count++;
+
+			if (failed_read_count >= MAX_FAILED_READS)
+			{
+				blog(LOG_WARNING, "obs-ntr: Data socket received no data after %d attempts; probably not active", failed_read_count);
+				break;
+			}
+
 			sched_yield();
 		}
 	}
 
+	closesocket(data_socket);
+	connection_data->net_thread_exited = true;
+
 	return 0;
+
+exception:
+	if (data_socket != INVALID_SOCKET)
+	{
+		closesocket(data_socket);
+	}
+
+	connection_data->net_thread_exited = true;
+	return (void *)1;
 }
 
-
+static struct ntr_data *connection_owner = NULL;
 static struct ntr_connection_data *shared_connection_data = NULL;
 
 void obs_ntr_connection_create(struct ntr_connection_setup *connection_setup)
@@ -346,6 +454,8 @@ void obs_ntr_connection_create(struct ntr_connection_setup *connection_setup)
 	pthread_attr_init(thread_settings);
 	pthread_attr_setschedparam(thread_settings, &thread_schedparam);
 
+	shared_connection_data->net_thread_exited = false;
+	shared_connection_data->net_thread_started = true;
 	pthread_create(&shared_connection_data->net_thread, thread_settings, obs_ntr_net_thread_run, shared_connection_data);
 
 	pthread_attr_destroy(thread_settings);
@@ -358,7 +468,7 @@ void obs_ntr_connection_destroy()
 
 	if (temp_connection_data != NULL)
 	{
-		temp_connection_data->is_connected = false;
+		temp_connection_data->disconnect_requested = true;
 		pthread_join(temp_connection_data->net_thread, NULL);
 
 		for (int screen_index = 0; screen_index < SCREEN_COUNT; screen_index++)
@@ -368,8 +478,6 @@ void obs_ntr_connection_destroy()
 		}
 
 		tjDestroy(temp_connection_data->decompressor_handle);
-
-		closesocket(temp_connection_data->data_socket);
 
 		for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
 		{
@@ -396,6 +504,8 @@ static void *obs_ntr_create(obs_data_t *settings, obs_source_t *source)
 
 	if (obs_data_get_bool(settings, "owns_connection"))
 	{
+		connection_owner = context;
+
 		context->pending_connect = true;
 	}
 
@@ -408,7 +518,7 @@ static void obs_ntr_destroy(void *data)
 {
 	struct ntr_data *context = data;
 
-	if (context->owns_connection)
+	if (connection_owner == context && shared_connection_data != NULL)
 	{
 		obs_ntr_connection_destroy();
 	}
@@ -433,6 +543,43 @@ bool connect_clicked(obs_properties_t *props, obs_property_t *property, void *da
 	return true;
 }
 
+
+bool claim_connection_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	struct ntr_data *context = data;
+
+	struct ntr_data *old_owner = connection_owner;
+	connection_owner = context;
+
+	context->pending_property_refresh = true;
+
+	if (old_owner != NULL)
+	{
+		obs_data_t *old_owner_settings = obs_source_get_settings(old_owner->source);
+		obs_data_set_bool(old_owner_settings, "owns_connection", false);
+		obs_source_update(old_owner->source, old_owner_settings);
+	}
+
+	obs_data_t *new_owner_settings = obs_source_get_settings(context->source);
+	obs_data_set_bool(new_owner_settings, "owns_connection", true);
+	obs_source_update(context->source, new_owner_settings);
+
+	return true;
+}
+
+bool start_remoteview_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	struct ntr_data *context = data;
+
+	pthread_create(&context->startup_remoteview_thread, NULL, obs_ntr_startup_remoteview_thread_run, context);
+	context->startup_remoteview_thread_started = true;
+
+	context->pending_property_refresh = true;
+	obs_source_update(context->source, NULL);
+
+	return true;
+}
+
 static obs_properties_t *obs_ntr_properties(void *data)
 {
 	struct ntr_data *context = data;
@@ -443,31 +590,31 @@ static obs_properties_t *obs_ntr_properties(void *data)
 	obs_property_list_add_int(screen_prop, obs_module_text("Ntr.Screen.Top"), SCREEN_TOP);
 	obs_property_list_add_int(screen_prop, obs_module_text("Ntr.Screen.Bottom"), SCREEN_BOTTOM);
 
-	if (context->owns_connection)
+	if (context == connection_owner)
 	{
 		obs_properties_add_button(props, "connect", 
 			(shared_connection_data == NULL ? obs_module_text("Ntr.Connect") : obs_module_text("Ntr.Disconnect")), 
 			connect_clicked);
+
+		obs_property_t *start_remoteview_prop = obs_properties_add_button(props, "start_remoteview", obs_module_text("Ntr.StartRemoteView"), start_remoteview_clicked);
+		obs_property_set_enabled(start_remoteview_prop, shared_connection_data == NULL && !context->startup_remoteview_thread_started);
+
+		obs_properties_add_text(props, "ip_address", obs_module_text("Ntr.IpAddress"), OBS_TEXT_DEFAULT);
+
+		obs_properties_add_int_slider(props, "quality", obs_module_text("Ntr.Quality"), 10, 100, 1);
+
+		obs_properties_add_int(props, "qos", obs_module_text("Ntr.Qos"), 0, 101, 1);
+
+		obs_properties_add_int(props, "priority_factor", obs_module_text("Ntr.PriorityFactor"), 0, 10, 1);
+
+		obs_property_t *priority_screen_prop = obs_properties_add_list(props, "priority_screen", obs_module_text("Ntr.PriorityScreen"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+		obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Top"), SCREEN_TOP);
+		obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Bottom"), SCREEN_BOTTOM);
 	}
-
-	if (shared_connection_data == NULL)
+	else
 	{
-		obs_properties_add_bool(props, "owns_connection", obs_module_text("Ntr.OwnsConnection"));
-
-		if (context->owns_connection)
-		{
-			obs_properties_add_text(props, "ip_address", obs_module_text("Ntr.IpAddress"), OBS_TEXT_DEFAULT);
-
-			obs_properties_add_int_slider(props, "quality", obs_module_text("Ntr.Quality"), 10, 100, 1);
-
-			obs_properties_add_int(props, "qos", obs_module_text("Ntr.Qos"), 0, 101, 1);
-
-			obs_properties_add_int(props, "priority_factor", obs_module_text("Ntr.PriorityFactor"), 0, 10, 1);
-
-			obs_property_t *priority_screen_prop = obs_properties_add_list(props, "priority_screen", obs_module_text("Ntr.PriorityScreen"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-			obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Top"), SCREEN_TOP);
-			obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Bottom"), SCREEN_BOTTOM);
-		}
+		obs_property_t *claim_connection_prop = obs_properties_add_button(props, "claim_connection", obs_module_text("Ntr.ClaimConnection"), claim_connection_clicked);
+		obs_property_set_enabled(claim_connection_prop, shared_connection_data == NULL);
 	}
 
 	return props;
@@ -477,13 +624,6 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 {
 	struct ntr_data *context = data;
 
-	bool new_owns_connection = obs_data_get_bool(settings, "owns_connection");
-	if (new_owns_connection != context->owns_connection)
-	{
-		context->owns_connection = new_owns_connection;
-		obs_source_update_properties(context->source);
-	}
-
 	context->screen = obs_data_get_int(settings, "screen");
 
 	dstr_copy(&context->connection_setup.ip_address, obs_data_get_string(settings, "ip_address"));
@@ -491,6 +631,16 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 	context->connection_setup.qos = (int)obs_data_get_int(settings, "qos");
 	context->connection_setup.priority_factor = (int)obs_data_get_int(settings, "priority_factor");
 	context->connection_setup.priority_screen = (int)obs_data_get_int(settings, "priority_screen");
+
+	if (context == connection_owner && !obs_data_get_bool(settings, "owns_connection"))
+	{
+		if (shared_connection_data != NULL)
+		{
+			obs_ntr_connection_destroy();
+		}
+
+		connection_owner = NULL;
+	}
 
 	obs_enter_graphics();
 
@@ -502,6 +652,11 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 	context->texture = gs_texture_create(SCREEN_HEIGHT[context->screen], SCREEN_WIDTH[context->screen], GS_RGBA, 1, NULL, GS_DYNAMIC);
 
 	obs_leave_graphics();
+
+	if (context->pending_property_refresh)
+	{
+		obs_source_update_properties(context->source);
+	}
 
 	if (context->pending_connect)
 	{
@@ -523,15 +678,34 @@ static void obs_ntr_tick(void *data, float seconds)
 {
 	struct ntr_data *context = data;
 
-	if (shared_connection_data != NULL && shared_connection_data->last_frame_id[context->screen] != context->last_frame_id)
+	if (context->startup_remoteview_thread_started && !context->startup_remoteview_thread_running)
 	{
-		context->last_frame_id = shared_connection_data->last_frame_id[context->screen];
+		context->startup_remoteview_thread_started = false;
 
-		pthread_mutex_lock(&shared_connection_data->buffer_mutex[context->screen]);
-		obs_enter_graphics();
-		gs_texture_set_image(context->texture, shared_connection_data->uncompressed_buffer[context->screen], SCREEN_HEIGHT[context->screen] * 4, false);
-		obs_leave_graphics();
-		pthread_mutex_unlock(&shared_connection_data->buffer_mutex[context->screen]);
+		context->pending_property_refresh = true;
+		obs_source_update(context->source, NULL);
+	}
+
+	if (shared_connection_data != NULL)
+	{
+		if (shared_connection_data->last_frame_id[context->screen] != context->last_frame_id)
+		{
+			context->last_frame_id = shared_connection_data->last_frame_id[context->screen];
+
+			pthread_mutex_lock(&shared_connection_data->buffer_mutex[context->screen]);
+			obs_enter_graphics();
+			gs_texture_set_image(context->texture, shared_connection_data->uncompressed_buffer[context->screen], SCREEN_HEIGHT[context->screen] * 4, false);
+			obs_leave_graphics();
+			pthread_mutex_unlock(&shared_connection_data->buffer_mutex[context->screen]);
+		}
+
+		if (shared_connection_data->net_thread_started && shared_connection_data->net_thread_exited)
+		{
+			obs_ntr_connection_destroy();
+
+			context->pending_property_refresh = true;
+			obs_source_update(context->source, NULL);
+		}
 	}
 }
 
