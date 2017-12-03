@@ -96,4 +96,5 @@ target_link_libraries(${PROJECT_NAME} turbojpeg)
 
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION obs-plugins/${_lib_suffix}bit)
 install(FILES ${CMAKE_BINARY_DIR}/Debug/${PROJECT_NAME}.pdb DESTINATION obs-plugins/${_lib_suffix}bit CONFIGURATIONS Debug)
+install(FILES ${TURBOJPEG_BIN_DIR}/turbojpeg.dll DESTINATION obs-plugins/${_lib_suffix}bit)
 install(DIRECTORY data/ DESTINATION data/obs-plugins/${PROJECT_NAME}/)
