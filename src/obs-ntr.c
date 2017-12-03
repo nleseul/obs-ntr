@@ -99,7 +99,7 @@ struct ntr_connection_data
 	bool net_thread_exited;
 	bool disconnect_requested;
 
-	struct ntr_connection_setup connection_setup;
+	bool write_stats_to_log;
 
 	tjhandle decompressor_handle;
 	unsigned char *uncompressed_buffer[SCREEN_COUNT];
@@ -123,6 +123,8 @@ struct ntr_data
 	int last_frame_id;
 
 	struct ntr_connection_setup connection_setup;
+
+	bool write_stats_to_log;
 
 	pthread_t startup_remoteview_thread;
 	bool startup_remoteview_thread_started;
@@ -223,13 +225,11 @@ exception:
 	return (void *)1;
 }
 
-#define MAX_FAILED_READS 100
+#define DATA_SOCKET_TIMEOUT_DURATION_NS 1000000000
 
 void *obs_ntr_net_thread_run(void *data)
 {
 	struct ntr_connection_data *connection_data = data;
-
-	int failed_read_count = 0;
 
 	connection_data->disconnect_requested = false;
 	
@@ -269,21 +269,26 @@ void *obs_ntr_net_thread_run(void *data)
 	connection_data->frames_dumped = 0;
 	connection_data->last_stat_time = obs_get_video_frame_time();
 
+	uint64_t last_read_time = obs_get_video_frame_time();
+
 	while (!connection_data->disconnect_requested)
 	{
 		if (connection_data->frames_processed >= 100)
 		{
-			uint64_t now = obs_get_video_frame_time();
+			if (connection_data->write_stats_to_log)
+			{
+				uint64_t now = obs_get_video_frame_time();
 
-			uint64_t elapsed_ms = (now - connection_data->last_stat_time) / 1000000;
-			float elapsed_seconds = (float)(elapsed_ms) / 1000.0f;
-			float fps = (connection_data->frames_processed - connection_data->frames_dumped) / elapsed_seconds;
+				uint64_t elapsed_ms = (now - connection_data->last_stat_time) / 1000000;
+				float elapsed_seconds = (float)(elapsed_ms) / 1000.0f;
+				float fps = (connection_data->frames_processed - connection_data->frames_dumped) / elapsed_seconds;
 
-			blog(LOG_DEBUG, "obs-ntr: Dropped %d/%d frames; effective fps=%f", connection_data->frames_dumped, connection_data->frames_processed, fps);
+				blog(LOG_DEBUG, "obs-ntr: Dropped %d/%d frames; effective fps=%f", connection_data->frames_dumped, connection_data->frames_processed, fps);
 
-			connection_data->frames_processed = 0;
-			connection_data->frames_dumped = 0;
-			connection_data->last_stat_time = now;
+				connection_data->frames_processed = 0;
+				connection_data->frames_dumped = 0;
+				connection_data->last_stat_time = now;
+			}
 		}
 
 		struct sockaddr_in from_address;
@@ -295,7 +300,7 @@ void *obs_ntr_net_thread_run(void *data)
 		{
 			struct ntr_frame_data *active_frame = NULL;
 
-			failed_read_count = 0;
+			last_read_time = obs_get_video_frame_time();
 
 			for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
 			{
@@ -382,11 +387,11 @@ void *obs_ntr_net_thread_run(void *data)
 		}
 		else
 		{
-			failed_read_count++;
+			uint64_t elapsed_ns_since_last_read = obs_get_video_frame_time() - last_read_time;
 
-			if (failed_read_count >= MAX_FAILED_READS)
+			if (elapsed_ns_since_last_read >= DATA_SOCKET_TIMEOUT_DURATION_NS)
 			{
-				blog(LOG_WARNING, "obs-ntr: Data socket received no data after %d attempts; probably not active", failed_read_count);
+				blog(LOG_WARNING, "obs-ntr: Data socket received no data after %d ms; probably not active", elapsed_ns_since_last_read / 1000000);
 				break;
 			}
 
@@ -412,15 +417,11 @@ exception:
 static struct ntr_data *connection_owner = NULL;
 static struct ntr_connection_data *shared_connection_data = NULL;
 
-void obs_ntr_connection_create(struct ntr_connection_setup *connection_setup)
+void obs_ntr_connection_create(struct ntr_data *owner_data)
 {
 	struct ntr_connection_data *temp_connection_data = bzalloc(sizeof(struct ntr_connection_data));
 
-	dstr_copy_dstr(&temp_connection_data->connection_setup.ip_address, &connection_setup->ip_address);
-	temp_connection_data->connection_setup.quality = connection_setup->quality;
-	temp_connection_data->connection_setup.qos = connection_setup->qos;
-	temp_connection_data->connection_setup.priority_factor = connection_setup->priority_factor;
-	temp_connection_data->connection_setup.priority_screen = connection_setup->priority_screen;
+	temp_connection_data->write_stats_to_log = owner_data->write_stats_to_log;
 
 	temp_connection_data->decompressor_handle = tjInitDecompress();
 
@@ -610,6 +611,8 @@ static obs_properties_t *obs_ntr_properties(void *data)
 		obs_property_t *priority_screen_prop = obs_properties_add_list(props, "priority_screen", obs_module_text("Ntr.PriorityScreen"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 		obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Top"), SCREEN_TOP);
 		obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Bottom"), SCREEN_BOTTOM);
+
+		obs_properties_add_bool(props, "write_stats_to_log", obs_module_text("Ntr.WriteStatsToLog"));
 	}
 	else
 	{
@@ -631,6 +634,8 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 	context->connection_setup.qos = (int)obs_data_get_int(settings, "qos");
 	context->connection_setup.priority_factor = (int)obs_data_get_int(settings, "priority_factor");
 	context->connection_setup.priority_screen = (int)obs_data_get_int(settings, "priority_screen");
+
+	context->write_stats_to_log = obs_data_get_bool(settings, "write_stats_to_log");
 
 	if (context == connection_owner && !obs_data_get_bool(settings, "owns_connection"))
 	{
@@ -669,7 +674,7 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 		}
 		else if (!dstr_is_empty(&context->connection_setup.ip_address))
 		{
-			obs_ntr_connection_create(&context->connection_setup);
+			obs_ntr_connection_create(context);
 		}
 	}
 }
@@ -746,10 +751,11 @@ static uint32_t obs_ntr_getheight(void *data)
 
 static void obs_ntr_defaults(obs_data_t *settings)
 {
-
 	obs_data_set_default_bool(settings, "owns_connection", false);
 
 	obs_data_set_default_int(settings, "screen", SCREEN_TOP);
+
+	obs_data_set_default_bool(settings, "write_stats_to_log", false);
 
 	obs_data_set_default_int(settings, "quality", 80);
 	obs_data_set_default_int(settings, "priority_factor", 2);
