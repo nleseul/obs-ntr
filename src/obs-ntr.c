@@ -260,6 +260,7 @@ void *obs_ntr_net_thread_run(void *data)
 	{
 		blog(LOG_WARNING, "obs-ntr: Unable to set buffer size on data socket");
 	}
+
 	if (setsockopt(data_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(struct timeval)) != 0)
 	{
 		blog(LOG_WARNING, "obs-ntr: Unable to set timeout on data socket");
@@ -300,13 +301,18 @@ void *obs_ntr_net_thread_run(void *data)
 		{
 			struct ntr_frame_data *active_frame = NULL;
 
+			//blog(LOG_DEBUG, "obs-ntr: Received packet %d of frame id %d(%d)", packet.order, packet.id, packet.is_top);
+			//blog(LOG_DEBUG, "obs-ntr: Current frames: %d(%d) %d(%d) %d(%d) %d(%d)", connection_data->frames[0].id, connection_data->frames[0].is_top,
+				//connection_data->frames[1].id, connection_data->frames[1].is_top, connection_data->frames[2].id, connection_data->frames[2].is_top,
+				//connection_data->frames[3].id, connection_data->frames[3].is_top);
+
 			last_read_time = obs_get_video_frame_time();
 
 			for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
 			{
-				if ((connection_data->frames[frame_index].id == packet.id && connection_data->frames[frame_index].is_top == packet.is_top) ||
-					connection_data->frames[frame_index].finished)
+				if (connection_data->frames[frame_index].id == packet.id && connection_data->frames[frame_index].is_top == packet.is_top)
 				{
+					//blog(LOG_DEBUG, "obs-ntr: Found existing frame");
 					active_frame = &connection_data->frames[frame_index];
 					break;
 				}
@@ -325,6 +331,8 @@ void *obs_ntr_net_thread_run(void *data)
 					}
 				}
 
+				//blog(LOG_DEBUG, "obs-ntr: Replacing old frame %d", connection_data->frames[oldest_index].id);
+
 				active_frame = &connection_data->frames[oldest_index];
 			}
 
@@ -334,9 +342,9 @@ void *obs_ntr_net_thread_run(void *data)
 			{
 				if (!active_frame->finished)
 				{
-					/*blog(LOG_DEBUG, "Dumping frame %d (%d/%d) for frame %d (%d)", active_frame->id,
-						active_frame->packet_count, active_frame->expected_packet_count,
-						packet.id, packet.is_top);*/
+					//blog(LOG_DEBUG, "obs-ntr: Dumping frame %d (%d/%d) for frame %d (%d)", active_frame->id,
+						//active_frame->packet_count, active_frame->expected_packet_count,
+						//packet.id, packet.is_top);
 
 					connection_data->frames_processed++;
 					connection_data->frames_dumped++;
@@ -366,9 +374,11 @@ void *obs_ntr_net_thread_run(void *data)
 
 			active_frame->packet_count++;
 
+			//blog(LOG_DEBUG, "obs-ntr: Frame %d now has %d/%d packets", active_frame->id, active_frame->packet_count, active_frame->expected_packet_count);
+
 			if (active_frame->expected_packet_count > 0 && active_frame->packet_count >= active_frame->expected_packet_count)
 			{
-				//blog(LOG_DEBUG, "Finishing frame %d with %d/%d packets", active_frame->id, active_frame->packet_count, active_frame->expected_packet_count);
+				//blog(LOG_DEBUG, "obs-ntr: Finishing frame %d with %d/%d packets", active_frame->id, active_frame->packet_count, active_frame->expected_packet_count);
 
 				active_frame->finished = true;
 
@@ -394,9 +404,12 @@ void *obs_ntr_net_thread_run(void *data)
 				blog(LOG_WARNING, "obs-ntr: Data socket received no data after %d ms; probably not active", elapsed_ns_since_last_read / 1000000);
 				break;
 			}
-
-			sched_yield();
 		}
+
+		// It seems to be critical to our packet loss rate to wait for a non-zero duration here,
+		// probably so the OS has adequate time to populate the socket's buffer. Note that I'm
+		// passing 2, because the Windows implementation reduces the value by 1 for some reason. 
+		os_sleep_ms(2);
 	}
 
 	closesocket(data_socket);
@@ -448,18 +461,9 @@ void obs_ntr_connection_create(struct ntr_data *owner_data)
 
 	shared_connection_data = temp_connection_data;
 
-	struct sched_param thread_schedparam;
-	thread_schedparam.sched_priority = 10;
-
-	pthread_attr_t *thread_settings = NULL;
-	pthread_attr_init(thread_settings);
-	pthread_attr_setschedparam(thread_settings, &thread_schedparam);
-
 	shared_connection_data->net_thread_exited = false;
 	shared_connection_data->net_thread_started = true;
-	pthread_create(&shared_connection_data->net_thread, thread_settings, obs_ntr_net_thread_run, shared_connection_data);
-
-	pthread_attr_destroy(thread_settings);
+	pthread_create(&shared_connection_data->net_thread, NULL, obs_ntr_net_thread_run, shared_connection_data);
 }
 
 void obs_ntr_connection_destroy()
