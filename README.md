@@ -32,10 +32,10 @@ necessary files should look like this:
     |---obs-plugins
         |---32bit
         |   |---obs-ntr.dll
-        |   |---turbojpeg.dll (????)
+        |   |---turbojpeg.dll
         |---64bit
             |---obs-ntr.dll
-            |---turbojpeg.dll (????)
+            |---turbojpeg.dll
 
 ## Usage
 
@@ -43,7 +43,30 @@ necessary files should look like this:
 
 ## Building
 
-(TODO)
+If you wish to build the obs-ntr plugin from source, you should just need [CMake](https://cmake.org/), 
+the OBS Studio libraries and headers, and the TurboJPEG libraries and headers. 
+
+* [obs-ntr source repository](https://github.com/nleseul/obs-ntr)
+* [OBS studio source repository](https://github.com/jp9000/obs-studio)
+* [libjpeg-turbo project](https://libjpeg-turbo.org/)
+
+I don't believe that the OBS project provides prebuilt libraries; you're probably going to have the best luck
+building your own OBS binaries from the source. Refer to the OBS repository for more information on that.
+
+The installers for libjpeg-turbo provide both headers and binaries, so you should be fine there. 
+
+When building in CMake, you will probably need to set two configuration values so your environment can be
+properly set up:
+
+* OBSSourcePath should refer to the libobs subfolder in the OBS source release. The build pipeline will look
+  for headers in this location, and for libraries in a "build" folder relative to that path (where the OBS 
+  build process puts them). 
+* TurboJPEG path should refer to the root folder of a libjpeg-turbo installation. The installer will make this
+  C:\libjpeg-turbo\ or C:\libjpeg-turbo64\ by default. This folder should contain include\, lib\, and bin\ 
+  subfolders.
+
+The CMake INSTALL script should function properly, as long as you set CMAKE_INSTALL_PREFIX to the root folder
+of the OBS Studio installation to which you wish to install. 
 
 ## License
 
@@ -53,4 +76,4 @@ mess to deal with and I don't like it.
 Unfortunately, this software is based in part on the work of the Independent JPEG Group. I'd love to avoid that
 dependency and use the JPEG handling that OBS Studio already provides, but it doesn't seem to be exposed in precisely 
 the right way for now. Until then, refer to either the [libjpeg-turbo repository](https://github.com/libjpeg-turbo) or 
-the included LICENSE-TurbonJPEG.md file for further details. 
+the included LICENSE-TurboJPEG.md file for further details. 
