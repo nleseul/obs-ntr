@@ -39,7 +39,42 @@ necessary files should look like this:
 
 ## Usage
 
-(TODO)
+The source provided by this plugin is called "3DS capture (NTR)" in OBS Studio's source creation menu. Each
+such source represents one of the 3DS's two screens, so in most applications you will probably want to have
+at least two of them in your scene. The most obvious property for this source is which screen it will
+display: "Bottom" or "Top."
+
+To save system resources, all instances of the obs-ntr source share connection data. Because at this time,
+options in OBS cannot be set outside of the context of some particular source, one of the instances must
+identify itself as being responsible for the connection. To do this, press the "Claim Responsibility for
+NTR Connection" button for the desired source. This should immediately present a number of additional options.
+
+You will need to start by entering the IP address of your 3DS in the "IP Address" box. Unfortunately, finding
+a 3DS's IP address is not the easiest thing, and how to do so is beyond the scope of this document. The simplest
+way is usually to look at the registered devices in your router's administration interface. 
+
+After entering your IP address, the next thing you will likely need to do is press the "Send NTR Remote View 
+Startup Message." This will send a message to the NTR process running on the specified 3DS to begin sending 
+remote view packets back to your PC. Note that once NTR starts doing this, there is no way to make it stop
+other than to reboot your 3DS (as far as I know). There is also no way to reconfigure it with different settings
+without rebooting the 3DS. This step is unnecessary if you have already started up NTR's remote view with another
+program like Nitro_Stream. 
+
+The options below that button instruct NTR how it should behave when producing its screen captures. They are the
+same options exposed by Nitro_Stream, NTRViewer, and other programs, and should have the same meaning as there.
+* "Picture Quality" presumably affects how much it compresses each JPEG frame it sends. 
+* I'm not entirely sure at this time what "Quality of Service" does. Apparently any value above 100 disables 
+  it, and many sources recommend using a value of 101 to do so. 
+* "Priority Factor" and "Priority Screen" seem to affect the ratio of frames sent for each screen. A priority
+  factor of 3 with the priority screen set to "Top" would instruct NTR to send 3 times as many frames for the
+  top screen as for the bottom screen. I believe a priority of 0 would completely disable one of the screens.
+  
+Once NTR is sending frames, you can instruct obs-ntr to start receiving them with the "Connect to NTR" button. 
+You can stop receiving at any time subsequently if desired by pressing "Disconnect from NTR."
+
+The "Write Connection Stats to Log" option will output statistics about the number of frames obs-ntr has dropped
+due to incomplete data. As far as I can tell, these are computed the same way that NTRViewer does, so you should
+be able to compare performance between the two programs. 
 
 ## Building
 
