@@ -601,6 +601,8 @@ static obs_properties_t *obs_ntr_properties(void *data)
 			(shared_connection_data == NULL ? obs_module_text("Ntr.Connect") : obs_module_text("Ntr.Disconnect")), 
 			connect_clicked);
 
+		obs_properties_add_bool(props, "write_stats_to_log", obs_module_text("Ntr.WriteStatsToLog"));
+
 		obs_property_t *start_remoteview_prop = obs_properties_add_button(props, "start_remoteview", obs_module_text("Ntr.StartRemoteView"), start_remoteview_clicked);
 		obs_property_set_enabled(start_remoteview_prop, shared_connection_data == NULL && !context->startup_remoteview_thread_started);
 
@@ -615,8 +617,6 @@ static obs_properties_t *obs_ntr_properties(void *data)
 		obs_property_t *priority_screen_prop = obs_properties_add_list(props, "priority_screen", obs_module_text("Ntr.PriorityScreen"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 		obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Top"), SCREEN_TOP);
 		obs_property_list_add_int(priority_screen_prop, obs_module_text("Ntr.Screen.Bottom"), SCREEN_BOTTOM);
-
-		obs_properties_add_bool(props, "write_stats_to_log", obs_module_text("Ntr.WriteStatsToLog"));
 	}
 	else
 	{
