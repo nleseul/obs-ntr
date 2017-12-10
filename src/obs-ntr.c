@@ -99,16 +99,15 @@ struct ntr_connection_data
 	bool net_thread_exited;
 	bool disconnect_requested;
 
-	bool write_stats_to_log;
-
 	tjhandle decompressor_handle;
 	unsigned char *uncompressed_buffer[SCREEN_COUNT];
 	int last_frame_id[SCREEN_COUNT];
 
 	struct ntr_frame_data frames[CONCURRENT_FRAMES];
 
-	int frames_processed;
-	int frames_dumped;
+	int dropped_frames;
+	int total_processed_frames;
+	float fps;
 	uint64_t last_stat_time;
 };
 
@@ -124,13 +123,15 @@ struct ntr_data
 
 	struct ntr_connection_setup connection_setup;
 
-	bool write_stats_to_log;
-
 	pthread_t startup_remoteview_thread;
 	bool startup_remoteview_thread_started;
 	bool startup_remoteview_thread_running;
 
 	gs_texture_t *texture;
+
+	bool show_stats;
+	obs_source_t *debug_text_source;
+	uint64_t last_stat_time;
 };
 
 
@@ -266,30 +267,31 @@ void *obs_ntr_net_thread_run(void *data)
 		blog(LOG_WARNING, "obs-ntr: Unable to set timeout on data socket");
 	}
 
-	connection_data->frames_processed = 0;
-	connection_data->frames_dumped = 0;
-	connection_data->last_stat_time = obs_get_video_frame_time();
-
+	int frames_processed = 0;
+	int frames_dumped = 0;
+	uint64_t last_stat_time = obs_get_video_frame_time();
 	uint64_t last_read_time = obs_get_video_frame_time();
+
+	connection_data->last_stat_time = last_stat_time;
 
 	while (!connection_data->disconnect_requested)
 	{
-		if (connection_data->frames_processed >= 100)
+		if (frames_processed >= 100)
 		{
-			if (connection_data->write_stats_to_log)
-			{
-				uint64_t now = obs_get_video_frame_time();
+			uint64_t now = obs_get_video_frame_time();
 
-				uint64_t elapsed_ms = (now - connection_data->last_stat_time) / 1000000;
-				float elapsed_seconds = (float)(elapsed_ms) / 1000.0f;
-				float fps = (connection_data->frames_processed - connection_data->frames_dumped) / elapsed_seconds;
+			uint64_t elapsed_ms = (now - last_stat_time) / 1000000;
+			float elapsed_seconds = (float)(elapsed_ms) / 1000.0f;
+			float fps = (frames_processed - frames_dumped) / elapsed_seconds;
 
-				blog(LOG_INFO, "obs-ntr: Dropped %d/%d frames; effective fps=%f", connection_data->frames_dumped, connection_data->frames_processed, fps);
+			connection_data->dropped_frames = frames_dumped;
+			connection_data->total_processed_frames = frames_processed;
+			connection_data->fps = fps;
+			connection_data->last_stat_time = now;
 
-				connection_data->frames_processed = 0;
-				connection_data->frames_dumped = 0;
-				connection_data->last_stat_time = now;
-			}
+			frames_processed = 0;
+			frames_dumped = 0;
+			last_stat_time = now;
 		}
 
 		struct sockaddr_in from_address;
@@ -346,8 +348,8 @@ void *obs_ntr_net_thread_run(void *data)
 						//active_frame->packet_count, active_frame->expected_packet_count,
 						//packet.id, packet.is_top);
 
-					connection_data->frames_processed++;
-					connection_data->frames_dumped++;
+					frames_processed++;
+					frames_dumped++;
 				}
 
 				active_frame->is_top = packet.is_top;
@@ -382,7 +384,7 @@ void *obs_ntr_net_thread_run(void *data)
 
 				active_frame->finished = true;
 
-				connection_data->frames_processed++;
+				frames_processed++;
 
 				pthread_mutex_lock(&connection_data->buffer_mutex[packet.is_top]);
 				int decompress_result = tjDecompress2(connection_data->decompressor_handle, active_frame->frame_data,
@@ -433,8 +435,6 @@ static struct ntr_connection_data *shared_connection_data = NULL;
 void obs_ntr_connection_create(struct ntr_data *owner_data)
 {
 	struct ntr_connection_data *temp_connection_data = bzalloc(sizeof(struct ntr_connection_data));
-
-	temp_connection_data->write_stats_to_log = owner_data->write_stats_to_log;
 
 	temp_connection_data->decompressor_handle = tjInitDecompress();
 
@@ -528,6 +528,11 @@ static void obs_ntr_destroy(void *data)
 		obs_ntr_connection_destroy();
 	}
 
+	if (context->debug_text_source != NULL)
+	{
+		obs_source_release(context->debug_text_source);
+	}
+
 	if (context->texture != NULL)
 	{
 		obs_enter_graphics();
@@ -536,6 +541,16 @@ static void obs_ntr_destroy(void *data)
 	}
 
 	bfree(context);
+}
+
+void obs_ntr_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
+{
+	struct ntr_data *context = data;
+
+	if (context->debug_text_source != NULL)
+	{
+		cb(context->source, context->debug_text_source, param);
+	}
 }
 
 bool connect_clicked(obs_properties_t *props, obs_property_t *property, void *data)
@@ -595,13 +610,13 @@ static obs_properties_t *obs_ntr_properties(void *data)
 	obs_property_list_add_int(screen_prop, obs_module_text("Ntr.Screen.Top"), SCREEN_TOP);
 	obs_property_list_add_int(screen_prop, obs_module_text("Ntr.Screen.Bottom"), SCREEN_BOTTOM);
 
+	obs_properties_add_bool(props, "show_stats", obs_module_text("Ntr.ShowStats"));
+
 	if (context == connection_owner)
 	{
 		obs_properties_add_button(props, "connect", 
 			(shared_connection_data == NULL ? obs_module_text("Ntr.Connect") : obs_module_text("Ntr.Disconnect")), 
 			connect_clicked);
-
-		obs_properties_add_bool(props, "write_stats_to_log", obs_module_text("Ntr.WriteStatsToLog"));
 
 		obs_property_t *start_remoteview_prop = obs_properties_add_button(props, "start_remoteview", obs_module_text("Ntr.StartRemoteView"), start_remoteview_clicked);
 		obs_property_set_enabled(start_remoteview_prop, shared_connection_data == NULL && !context->startup_remoteview_thread_started);
@@ -640,7 +655,27 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 	context->connection_setup.priority_factor = (int)obs_data_get_int(settings, "priority_factor");
 	context->connection_setup.priority_screen = (int)obs_data_get_int(settings, "priority_screen");
 
-	context->write_stats_to_log = obs_data_get_bool(settings, "write_stats_to_log");
+	context->show_stats = obs_data_get_bool(settings, "show_stats");
+
+	if (context->show_stats && context->debug_text_source == NULL)
+	{
+		obs_data_t *text_defaults = obs_data_create();
+
+		obs_data_t *text_font = obs_data_create();
+		obs_data_set_int(text_font, "size", 24);
+		obs_data_set_obj(text_defaults, "font", text_font);
+		obs_data_release(text_font);
+		text_font = NULL;
+
+		context->debug_text_source = obs_source_create_private("text_gdiplus", NULL, text_defaults);
+
+		obs_data_release(text_defaults);
+	}
+	else if (!context->show_stats && context->debug_text_source != NULL)
+	{
+		obs_source_release(context->debug_text_source);
+		context->debug_text_source = NULL;
+	}
 
 	if (context == connection_owner && !obs_data_get_bool(settings, "owns_connection"))
 	{
@@ -714,6 +749,27 @@ static void obs_ntr_tick(void *data, float seconds)
 			pthread_mutex_unlock(&shared_connection_data->buffer_mutex[context->screen]);
 		}
 
+		if (context->debug_text_source != NULL && shared_connection_data->last_stat_time != context->last_stat_time)
+		{
+			char buffer[128];
+
+			float dropped_percent = 0.0f;
+			if (shared_connection_data->total_processed_frames > 0)
+			{
+				dropped_percent = ((float)shared_connection_data->dropped_frames * 100.0f / shared_connection_data->total_processed_frames);
+			}
+
+			snprintf(buffer, 128, "%.0f%% dropped; fps=%.1f", dropped_percent, shared_connection_data->fps);
+			context->last_stat_time = shared_connection_data->last_stat_time;
+
+			obs_data_t *new_text_data = obs_data_create();
+			obs_data_set_string(new_text_data, "text", buffer);
+
+			obs_source_update(context->debug_text_source, new_text_data);
+
+			obs_data_release(new_text_data);
+		}
+
 		if (shared_connection_data->net_thread_started && shared_connection_data->net_thread_exited)
 		{
 			obs_ntr_connection_destroy();
@@ -743,6 +799,11 @@ static void obs_ntr_render(void *data, gs_effect_t *effect)
 		gs_matrix_pop();
 	}
 
+	if (context->debug_text_source != NULL)
+	{
+		obs_source_video_render(context->debug_text_source);
+	}
+
 }
 
 static uint32_t obs_ntr_getwidth(void *data)
@@ -765,7 +826,7 @@ static void obs_ntr_defaults(obs_data_t *settings)
 
 	obs_data_set_default_int(settings, "screen", SCREEN_TOP);
 
-	obs_data_set_default_bool(settings, "write_stats_to_log", false);
+	obs_data_set_default_bool(settings, "show_stats", false);
 
 	obs_data_set_default_int(settings, "quality", 80);
 	obs_data_set_default_int(settings, "priority_factor", 2);
@@ -774,19 +835,20 @@ static void obs_ntr_defaults(obs_data_t *settings)
 }
 
 struct obs_source_info obs_ntr_source = {
-	.id             = "obs_ntr",
-	.type           = OBS_SOURCE_TYPE_INPUT,
-	.output_flags   = OBS_SOURCE_VIDEO,
-	.create         = obs_ntr_create,
-	.destroy        = obs_ntr_destroy,
-	.update         = obs_ntr_update,
-	.video_tick		= obs_ntr_tick,
-	.get_name       = obs_ntr_get_name,
-	.get_defaults   = obs_ntr_defaults,
-	.get_width      = obs_ntr_getwidth,
-	.get_height     = obs_ntr_getheight,
-	.video_render   = obs_ntr_render,
-	.get_properties = obs_ntr_properties
+	.id                  = "obs_ntr",
+	.type                = OBS_SOURCE_TYPE_INPUT,
+	.output_flags        = OBS_SOURCE_VIDEO,
+	.create              = obs_ntr_create,
+	.destroy             = obs_ntr_destroy,
+	.enum_active_sources = obs_ntr_enum_sources,
+	.update              = obs_ntr_update,
+	.video_tick          = obs_ntr_tick,
+	.get_name            = obs_ntr_get_name,
+	.get_defaults        = obs_ntr_defaults,
+	.get_width           = obs_ntr_getwidth,
+	.get_height          = obs_ntr_getheight,
+	.video_render        = obs_ntr_render,
+	.get_properties      = obs_ntr_properties
 };
 
 OBS_DECLARE_MODULE()
