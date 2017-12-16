@@ -41,6 +41,8 @@ const int SCREEN_HEIGHT[SCREEN_COUNT] =
 	240
 };
 
+#define TEMP_BUFFER_SIZE (320 * 400 * 4)
+
 struct ntr_command_packet
 {
 	int magic_number;
@@ -99,11 +101,8 @@ struct ntr_connection_data
 	bool net_thread_exited;
 	bool disconnect_requested;
 
-	tjhandle decompressor_handle;
 	unsigned char *uncompressed_buffer[SCREEN_COUNT];
 	int last_frame_id[SCREEN_COUNT];
-
-	struct ntr_frame_data frames[CONCURRENT_FRAMES];
 
 	int dropped_frames;
 	int total_processed_frames;
@@ -232,6 +231,21 @@ void *obs_ntr_net_thread_run(void *data)
 {
 	struct ntr_connection_data *connection_data = data;
 
+	tjhandle decompressor_handle = tjInitDecompress();
+
+	struct ntr_frame_data frames[CONCURRENT_FRAMES];
+	for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
+	{
+		frames[frame_index].id = 0;
+		frames[frame_index].packet_count = 0;
+		frames[frame_index].expected_packet_count = 0;
+		frames[frame_index].last_packet_data_size = 0;
+		frames[frame_index].finished = 0;
+		frames[frame_index].time_started = 0;
+
+		frames[frame_index].frame_data = bzalloc(DATA_PACKET_DATA_SIZE * DATA_PACKET_MAX_COUNT);
+	}
+
 	connection_data->disconnect_requested = false;
 	
 	struct sockaddr_in data_socket_address_data;
@@ -312,10 +326,10 @@ void *obs_ntr_net_thread_run(void *data)
 
 			for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
 			{
-				if (connection_data->frames[frame_index].id == packet.id && connection_data->frames[frame_index].is_top == packet.is_top)
+				if (frames[frame_index].id == packet.id && frames[frame_index].is_top == packet.is_top)
 				{
 					//blog(LOG_DEBUG, "obs-ntr: Found existing frame");
-					active_frame = &connection_data->frames[frame_index];
+					active_frame = &frames[frame_index];
 					break;
 				}
 			}
@@ -326,16 +340,16 @@ void *obs_ntr_net_thread_run(void *data)
 				uint64_t oldest_time = UINT64_MAX;
 				for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
 				{
-					if (connection_data->frames[frame_index].time_started < oldest_time)
+					if (frames[frame_index].time_started < oldest_time)
 					{
-						oldest_time = connection_data->frames[frame_index].time_started;
+						oldest_time = frames[frame_index].time_started;
 						oldest_index = frame_index;
 					}
 				}
 
 				//blog(LOG_DEBUG, "obs-ntr: Replacing old frame %d", connection_data->frames[oldest_index].id);
 
-				active_frame = &connection_data->frames[oldest_index];
+				active_frame = &frames[oldest_index];
 			}
 
 			assert(active_frame != NULL);
@@ -380,20 +394,21 @@ void *obs_ntr_net_thread_run(void *data)
 
 			if (active_frame->expected_packet_count > 0 && active_frame->packet_count >= active_frame->expected_packet_count)
 			{
+				char local_decompress_buffer[TEMP_BUFFER_SIZE];
+
 				//blog(LOG_DEBUG, "obs-ntr: Finishing frame %d with %d/%d packets", active_frame->id, active_frame->packet_count, active_frame->expected_packet_count);
 
 				active_frame->finished = true;
-
 				frames_processed++;
 
-				pthread_mutex_lock(&connection_data->buffer_mutex[packet.is_top]);
-				int decompress_result = tjDecompress2(connection_data->decompressor_handle, active_frame->frame_data,
+				int decompress_result = tjDecompress2(decompressor_handle, active_frame->frame_data,
 					(active_frame->expected_packet_count - 1) * DATA_PACKET_DATA_SIZE + active_frame->last_packet_data_size,
-					connection_data->uncompressed_buffer[packet.is_top], SCREEN_HEIGHT[packet.is_top], SCREEN_HEIGHT[packet.is_top] * 4,
+					local_decompress_buffer, SCREEN_HEIGHT[packet.is_top], SCREEN_HEIGHT[packet.is_top] * 4,
 					SCREEN_WIDTH[packet.is_top], TJPF_RGBA, 0);
 
+				pthread_mutex_lock(&connection_data->buffer_mutex[packet.is_top]);
+				memcpy(connection_data->uncompressed_buffer[packet.is_top], local_decompress_buffer, SCREEN_WIDTH[packet.is_top] * SCREEN_HEIGHT[packet.is_top] * 4);
 				connection_data->last_frame_id[packet.is_top] = packet.id;
-
 				pthread_mutex_unlock(&connection_data->buffer_mutex[packet.is_top]);
 			}
 		}
@@ -407,12 +422,18 @@ void *obs_ntr_net_thread_run(void *data)
 				break;
 			}
 		}
-
 		// It seems to be critical to our packet loss rate to wait for a non-zero duration here,
 		// probably so the OS has adequate time to populate the socket's buffer. Note that I'm
 		// passing 2, because the Windows implementation reduces the value by 1 for some reason. 
 		os_sleep_ms(2);
 	}
+
+	for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
+	{
+		bfree(frames[frame_index].frame_data);
+	}
+
+	tjDestroy(decompressor_handle);
 
 	closesocket(data_socket);
 	connection_data->net_thread_exited = true;
@@ -436,8 +457,6 @@ void obs_ntr_connection_create(struct ntr_data *owner_data)
 {
 	struct ntr_connection_data *temp_connection_data = bzalloc(sizeof(struct ntr_connection_data));
 
-	temp_connection_data->decompressor_handle = tjInitDecompress();
-
 	for (int screen_index = 0; screen_index < SCREEN_COUNT; screen_index++)
 	{
 		temp_connection_data->uncompressed_buffer[screen_index] = bzalloc(SCREEN_WIDTH[screen_index] * SCREEN_HEIGHT[screen_index] * 4);
@@ -445,19 +464,6 @@ void obs_ntr_connection_create(struct ntr_data *owner_data)
 		pthread_mutex_init_value(&temp_connection_data->buffer_mutex[screen_index]);
 		pthread_mutex_init(&temp_connection_data->buffer_mutex[screen_index], NULL);
 	}
-
-	for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
-	{
-		temp_connection_data->frames[frame_index].id = 0;
-		temp_connection_data->frames[frame_index].packet_count = 0;
-		temp_connection_data->frames[frame_index].expected_packet_count = 0;
-		temp_connection_data->frames[frame_index].last_packet_data_size = 0;
-		temp_connection_data->frames[frame_index].finished = 0;
-		temp_connection_data->frames[frame_index].time_started = 0;
-
-		temp_connection_data->frames[frame_index].frame_data = bzalloc(DATA_PACKET_DATA_SIZE * DATA_PACKET_MAX_COUNT);
-	}
-
 
 	shared_connection_data = temp_connection_data;
 
@@ -480,13 +486,6 @@ void obs_ntr_connection_destroy()
 		{
 			pthread_mutex_destroy(&temp_connection_data->buffer_mutex[screen_index]);
 			bfree(temp_connection_data->uncompressed_buffer[screen_index]);
-		}
-
-		tjDestroy(temp_connection_data->decompressor_handle);
-
-		for (int frame_index = 0; frame_index < CONCURRENT_FRAMES; frame_index++)
-		{
-			bfree(temp_connection_data->frames[frame_index].frame_data);
 		}
 
 		bfree(temp_connection_data);
@@ -740,13 +739,16 @@ static void obs_ntr_tick(void *data, float seconds)
 	{
 		if (shared_connection_data->last_frame_id[context->screen] != context->last_frame_id)
 		{
-			context->last_frame_id = shared_connection_data->last_frame_id[context->screen];
+			char local_image_buffer[TEMP_BUFFER_SIZE];
 
 			pthread_mutex_lock(&shared_connection_data->buffer_mutex[context->screen]);
-			obs_enter_graphics();
-			gs_texture_set_image(context->texture, shared_connection_data->uncompressed_buffer[context->screen], SCREEN_HEIGHT[context->screen] * 4, false);
-			obs_leave_graphics();
+			context->last_frame_id = shared_connection_data->last_frame_id[context->screen];
+			memcpy(local_image_buffer, shared_connection_data->uncompressed_buffer[context->screen], SCREEN_WIDTH[context->screen] * SCREEN_HEIGHT[context->screen] * 4);
 			pthread_mutex_unlock(&shared_connection_data->buffer_mutex[context->screen]);
+
+			obs_enter_graphics();
+			gs_texture_set_image(context->texture, local_image_buffer, SCREEN_HEIGHT[context->screen] * 4, false);
+			obs_leave_graphics();
 		}
 
 		if (context->debug_text_source != NULL && shared_connection_data->last_stat_time != context->last_stat_time)
