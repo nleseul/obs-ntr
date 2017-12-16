@@ -131,6 +131,7 @@ struct ntr_data
 	bool show_stats;
 	obs_source_t *debug_text_source;
 	uint64_t last_stat_time;
+	bool update_debug_text;
 };
 
 
@@ -518,6 +519,19 @@ static void *obs_ntr_create(obs_data_t *settings, obs_source_t *source)
 	return context;
 }
 
+static void obs_ntr_set_debug_text(struct ntr_data *context, const char *text)
+{
+	if (context->debug_text_source != NULL)
+	{
+		obs_data_t *new_text_data = obs_data_create();
+		obs_data_set_string(new_text_data, "text", text);
+
+		obs_source_update(context->debug_text_source, new_text_data);
+
+		obs_data_release(new_text_data);
+	}
+}
+
 static void obs_ntr_destroy(void *data)
 {
 	struct ntr_data *context = data;
@@ -669,6 +683,8 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 		context->debug_text_source = obs_source_create_private("text_gdiplus", NULL, text_defaults);
 
 		obs_data_release(text_defaults);
+
+		context->update_debug_text = true;
 	}
 	else if (!context->show_stats && context->debug_text_source != NULL)
 	{
@@ -720,6 +736,42 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 		{
 			obs_ntr_connection_create(context);
 		}
+
+		context->update_debug_text = true;
+	}
+
+	if (context->debug_text_source != NULL && context->update_debug_text)
+	{
+		if (shared_connection_data == NULL)
+		{
+			obs_ntr_set_debug_text(context, obs_module_text("Ntr.ShowStats.NotConnected"));
+		}
+		else
+		{
+			struct dstr buffer;
+			dstr_init_copy(&buffer, obs_module_text("Ntr.ShowStats.StatsDisplay"));
+
+			char dropped_percent_buffer[8];
+			char fps_buffer[8];
+
+			float dropped_percent = 0.0f;
+			if (shared_connection_data->total_processed_frames > 0)
+			{
+				dropped_percent = ((float)shared_connection_data->dropped_frames * 100.0f / shared_connection_data->total_processed_frames);
+			}
+
+			snprintf(dropped_percent_buffer, 8, "%.0f", dropped_percent);
+			snprintf(fps_buffer, 8, "%.1f", shared_connection_data->fps);
+
+			dstr_replace(&buffer, "%1", dropped_percent_buffer);
+			dstr_replace(&buffer, "%2", fps_buffer);
+
+			obs_ntr_set_debug_text(context, buffer.array);
+
+			dstr_free(&buffer);
+		}
+
+		context->update_debug_text = false;
 	}
 }
 
@@ -753,23 +805,9 @@ static void obs_ntr_tick(void *data, float seconds)
 
 		if (context->debug_text_source != NULL && shared_connection_data->last_stat_time != context->last_stat_time)
 		{
-			char buffer[128];
-
-			float dropped_percent = 0.0f;
-			if (shared_connection_data->total_processed_frames > 0)
-			{
-				dropped_percent = ((float)shared_connection_data->dropped_frames * 100.0f / shared_connection_data->total_processed_frames);
-			}
-
-			snprintf(buffer, 128, "%.0f%% dropped; fps=%.1f", dropped_percent, shared_connection_data->fps);
 			context->last_stat_time = shared_connection_data->last_stat_time;
-
-			obs_data_t *new_text_data = obs_data_create();
-			obs_data_set_string(new_text_data, "text", buffer);
-
-			obs_source_update(context->debug_text_source, new_text_data);
-
-			obs_data_release(new_text_data);
+			context->update_debug_text = true;
+			obs_source_update(context->source, NULL);
 		}
 
 		if (shared_connection_data->net_thread_started && shared_connection_data->net_thread_exited)
@@ -777,6 +815,7 @@ static void obs_ntr_tick(void *data, float seconds)
 			obs_ntr_connection_destroy();
 
 			context->pending_property_refresh = true;
+			context->update_debug_text = true;
 			obs_source_update(context->source, NULL);
 		}
 	}
