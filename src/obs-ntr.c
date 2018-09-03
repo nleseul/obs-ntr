@@ -129,6 +129,7 @@ struct ntr_data
 	gs_texture_t *texture;
 
 	bool show_stats;
+	bool mem_patch;
 	obs_source_t *debug_text_source;
 	uint64_t last_stat_time;
 	bool update_debug_text;
@@ -207,7 +208,28 @@ void *obs_ntr_startup_remoteview_thread_run(void *data)
 
 		os_sleep_ms(100);
 	}
-
+	if(context->mem_patch)
+	{
+		// This only works on firmwares 11.4 and later (tested on 11.6)
+		char p114[84] = { 0x78, 0x56, 0x34, 0x12, 0xc0, 0x5d, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 
+			0x00, 0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x5b, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+			0x00, 0x00, 0x02, 0x00, 0x00, 0x00 };
+		char pbuf[] = { 0x70, 0x47 };
+		
+		if (send(command_socket, (const char *)&p114, 84, 0) < 0)
+		{
+			blog(LOG_WARNING, "obs-ntr: Failed sending memory patch initializer to NTR");
+			goto exception;
+		}
+		if (send(command_socket, (const char *)&pbuf, 2, 0) < 0)
+		{
+			blog(LOG_WARNING, "obs-ntr: Failed sending memory patch payload to NTR");
+			goto exception;
+		}
+	}
 	closesocket(command_socket);
 
 	blog(LOG_WARNING, "obs-ntr: Startup command sent successfully to NTR");
@@ -627,6 +649,7 @@ static obs_properties_t *obs_ntr_properties(void *data)
 
 	if (context == connection_owner)
 	{
+		obs_properties_add_bool(props, "mem_patch", obs_module_text("Ntr.MemPatch"));
 		obs_properties_add_button(props, "connect", 
 			(shared_connection_data == NULL ? obs_module_text("Ntr.Connect") : obs_module_text("Ntr.Disconnect")), 
 			connect_clicked);
@@ -669,6 +692,7 @@ static void obs_ntr_update(void *data, obs_data_t *settings)
 	context->connection_setup.priority_screen = (int)obs_data_get_int(settings, "priority_screen");
 
 	context->show_stats = obs_data_get_bool(settings, "show_stats");
+	context->mem_patch = obs_data_get_bool(settings, "mem_patch");
 
 	if (context->show_stats && context->debug_text_source == NULL)
 	{
@@ -868,7 +892,8 @@ static void obs_ntr_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "screen", SCREEN_TOP);
 
 	obs_data_set_default_bool(settings, "show_stats", false);
-
+	obs_data_set_default_bool(settings, "mem_patch", false);
+	
 	obs_data_set_default_int(settings, "quality", 80);
 	obs_data_set_default_int(settings, "priority_factor", 2);
 	obs_data_set_default_int(settings, "qos", 100);

@@ -49,6 +49,13 @@ options in OBS cannot be set outside of the context of some particular source, o
 identify itself as being responsible for the connection. To do this, press the "Claim Responsibility for
 NTR Connection" button for the desired source. This should immediately present a number of additional options.
 
+If you know you will be playing games that disable Wi-Fi after lauch (Ocarina of Time, Pokémon) and you are on
+firmware 11.4 or later, you can check the option to send a patch to the system prior to connecting. If you do
+so, you will want to launch Rosalina with L+Down+Select and go to "Debugger options..." and select
+"Enable Debugger". Then back out of the Rosalina menu prior to attempting to connect. The patch will
+automatically be sent to the system during the connection process as long as the box is checked and the
+debugger has been turned on!
+
 You will need to start by entering the IP address of your 3DS in the "IP Address" box. Unfortunately, finding
 a 3DS's IP address is not the easiest thing, and how to do so is beyond the scope of this document. The simplest
 way is usually to look at the registered devices in your router's administration interface. 
